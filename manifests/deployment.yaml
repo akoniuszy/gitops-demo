@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-gitops
+  namespace: gitops-demo
+  labels:
+    app: hello-gitops
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hello-gitops
+  template:
+    metadata:
+      labels:
+        app: hello-gitops
+    spec:
+      containers:
+      - name: nginx
+        image: registry.redhat.io/ubi9/nginx-124:latest
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: html
+          mountPath: /opt/app-root/src
+      initContainers:
+      - name: init-html
+        image: registry.redhat.io/ubi9/ubi-minimal:latest
+        command: ['sh', '-c', 'echo "<h1>Hello from GitOps! v1</h1><p>Managed by ArgoCD</p>" > /html/index.html']
+        volumeMounts:
+        - name: html
+          mountPath: /html
+      volumes:
+      - name: html
+        emptyDir: {}

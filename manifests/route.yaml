@@ -2,7 +2,7 @@ apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
   name: hello-gitops
-  namespace: gitops-demo
+  namespace: dlh-lab
 spec:
   to:
     kind: Service

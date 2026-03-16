@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: hello-gitops
-  namespace: gitops-demo
+  namespace: dlh-lab
   labels:
     app: hello-gitops
 spec:

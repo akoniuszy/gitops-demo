@@ -12,7 +12,7 @@ manifests/
   route.yaml        # OpenShift Route
 ```
 
-## Wymagania
+## Konfiguracja ArgoCD
 
 Centralny ArgoCD w namespace `openshift-gitops` obsługuje Applications tworzone w namespace projektu (`dlh-lab`).
 
@@ -25,14 +25,75 @@ oc patch argocd openshift-gitops -n openshift-gitops --type merge \
   -p '{"spec":{"sourceNamespaces":["dlh-lab"]}}'
 ```
 
-### 2. sourceNamespaces w AppProject
+### 2. Dedykowany AppProject (zamiast default)
 
-Projekt ArgoCD musi pozwalać na Applications spoza `openshift-gitops`:
+**Nie używaj projektu `default`** — ma pełne uprawnienia do wszystkich namespace'ów i zasobów klastrowych.  
+Utwórz dedykowany AppProject z ograniczeniami:
 
 ```bash
-oc patch appproject default -n openshift-gitops --type merge \
-  -p '{"spec":{"sourceNamespaces":["dlh-lab"]}}'
+cat <<'EOF' | oc apply -f -
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: dlh-lab
+  namespace: openshift-gitops
+spec:
+  description: "Projekt zespolu DLH - tylko namespace dlh-lab"
+  # Tylko namespace dlh-lab na lokalnym klastrze
+  destinations:
+    - namespace: dlh-lab
+      server: https://kubernetes.default.svc
+  # Tylko repozytoria zespolu
+  sourceRepos:
+    - 'https://github.com/akoniuszy/*'
+  # Applications z namespace dlh-lab
+  sourceNamespaces:
+    - dlh-lab
+  # BRAK zasobow klastrowych (Namespace, ClusterRole, CRD itp.)
+  clusterResourceWhitelist: []
+  # Dozwolone typy zasobow w namespace
+  namespaceResourceWhitelist:
+    - group: ''
+      kind: ConfigMap
+    - group: ''
+      kind: Service
+    - group: ''
+      kind: Secret
+    - group: ''
+      kind: PersistentVolumeClaim
+    - group: apps
+      kind: Deployment
+    - group: apps
+      kind: StatefulSet
+    - group: apps
+      kind: ReplicaSet
+    - group: route.openshift.io
+      kind: Route
+    - group: networking.k8s.io
+      kind: Ingress
+    - group: networking.k8s.io
+      kind: NetworkPolicy
+    - group: batch
+      kind: Job
+    - group: batch
+      kind: CronJob
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+  # Blokada zasobow RBAC (zapobiega eskalacji uprawnien)
+  namespaceResourceBlacklist:
+    - group: rbac.authorization.k8s.io
+      kind: '*'
+EOF
 ```
+
+Zabezpieczenia AppProject:
+
+| Zagrożenie | Ochrona |
+|---|---|
+| Deploy do innego namespace | `destinations` — tylko `dlh-lab` |
+| Tworzenie zasobów klastrowych | `clusterResourceWhitelist: []` — puste |
+| Eskalacja uprawnień (RoleBinding) | `namespaceResourceBlacklist: rbac.authorization.k8s.io/*` |
+| Użycie obcego repo Git | `sourceRepos` — tylko `https://github.com/akoniuszy/*` |
 
 ### 3. RoleBinding dla kontrolera ArgoCD
 
@@ -49,6 +110,8 @@ oc create rolebinding argocd-controller-dlh-lab \
 
 ## Tworzenie Application
 
+Application **musi** wskazywać na projekt `dlh-lab` (nie `default`):
+
 ```bash
 cat <<'EOF' | oc apply -f -
 apiVersion: argoproj.io/v1alpha1
@@ -57,7 +120,7 @@ metadata:
   name: gitops-demo
   namespace: dlh-lab
 spec:
-  project: default
+  project: dlh-lab
   source:
     repoURL: https://github.com/akoniuszy/gitops-demo
     targetRevision: main
@@ -86,4 +149,10 @@ oc annotate application gitops-demo -n dlh-lab argocd.argoproj.io/refresh=hard -
 
 ## Dodawanie kolejnych namespace'ów
 
-Aby dodać ArgoCD do nowego namespace, powtórz kroki 1–3 z sekcji Wymagania, podmieniając `dlh-lab` na nowy namespace.
+Aby dodać ArgoCD do nowego namespace (np. `team-xyz`):
+
+1. Dodaj namespace do `sourceNamespaces` w ArgoCD CR
+2. Utwórz dedykowany AppProject (jak w kroku 2) z `destinations` i `sourceNamespaces` ustawionym na nowy namespace
+3. Utwórz RoleBinding dla kontrolera ArgoCD w nowym namespace (jak w kroku 3)
+
+**Nie dodawaj** nowych namespace'ów do projektu `default`.

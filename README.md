@@ -101,7 +101,29 @@ Zabezpieczenia AppProject:
 | Użycie obcego repo Git | `sourceRepos` — tylko `https://github.com/akoniuszy/*` |
 | Szerokie uprawnienia kontrolera | `destinationServiceAccounts` — impersonacja dedykowanego SA |
 
-### 3. Dedykowany ServiceAccount do deploymentu
+### 3. Włączenie impersonacji w ArgoCD
+
+Domyślnie ArgoCD **nie impersonuje** SA — kontroler działa jako swoje własne konto.  
+Aby aktywować impersonację (żeby `destinationServiceAccounts` z AppProject faktycznie działało), ustaw klucz `application.sync.impersonation.enabled` w `argocd-cm`.
+
+**Ważne:** ConfigMap `argocd-cm` jest zarządzany przez operator GitOps — bezpośredni `oc patch cm` zostanie nadpisany.  
+Należy użyć pola `extraConfig` w ArgoCD CR:
+
+```bash
+oc patch argocd openshift-gitops -n openshift-gitops --type merge \
+  -p '{"spec":{"extraConfig":{"application.sync.impersonation.enabled":"true"}}}'
+```
+
+Weryfikacja:
+```bash
+# Sprawdź czy klucz trafił do argocd-cm
+oc get cm argocd-cm -n openshift-gitops -o jsonpath='{.data.application\.sync\.impersonation\.enabled}'
+# Powinno zwrócić: true
+```
+
+> Ten krok wykonujesz **raz** — dotyczy całej instancji ArgoCD, nie per namespace.
+
+### 4. Dedykowany ServiceAccount do deploymentu
 
 Zamiast dawać kontrolerowi ArgoCD szeroki `edit` do namespace, tworzymy dedykowany SA z minimalnymi uprawnieniami. Kontroler ArgoCD **impersonuje** tego SA przy syncu.
 
@@ -159,6 +181,73 @@ EOF
 
 > Operator GitOps automatycznie tworzy dodatkowy RoleBinding `openshift-gitops_dlh-lab` po dodaniu `sourceNamespaces` w ArgoCD CR.
 
+### 5. Uprawnienia do impersonacji SA w namespace
+
+Kontroler ArgoCD potrzebuje verbu `impersonate` na docelowym ServiceAccount.  
+Kubernetes wymaga tego jawnie — samo `destinationServiceAccounts` w AppProject to tylko konfiguracja ArgoCD, ale k8s API musi pozwolić kontrolerowi działać "w imieniu" tego SA.
+
+Tworzymy namespaced Role + RoleBinding:
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: allow-argocd-impersonate-deployer
+  namespace: dlh-lab
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["impersonate"]
+    resourceNames: ["argocd-deployer-dlh-lab"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: allow-argocd-controller-impersonate
+  namespace: dlh-lab
+subjects:
+  - kind: ServiceAccount
+    name: openshift-gitops-argocd-application-controller
+    namespace: openshift-gitops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: allow-argocd-impersonate-deployer
+EOF
+```
+
+> **Bezpieczeństwo:** `resourceNames` ogranicza impersonację **tylko** do konkretnego SA (`argocd-deployer-dlh-lab`).  
+> Kontroler nie może impersonować żadnego innego konta w tym namespace.
+
+### Weryfikacja impersonacji
+
+Po wykonaniu kroków 3–5, sprawdź w audit logach API servera, że kontroler faktycznie impersonuje dedykowany SA:
+
+```bash
+# Szukaj w audit logu na dowolnym control plane
+for node in $(oc get nodes --selector=node-role.kubernetes.io/master -o name | sed 's|node/||'); do
+  echo "=== $node ==="
+  oc adm node-logs $node --path=kube-apiserver/audit.log 2>&1 | \
+    grep 'hello-gitops' | grep '"create"' | grep 'deployments' | tail -1 | \
+    python3 -c "
+import sys,json
+for line in sys.stdin:
+    e = json.loads(line.strip())
+    u = e.get('user',{}).get('username','?')
+    imp = e.get('impersonatedUser',{}).get('username','')
+    print(f'  user: {u}')
+    print(f'  impersonating: {imp}' if imp else '  NO impersonation')
+"
+done
+```
+
+Oczekiwany wynik:
+```
+user: system:serviceaccount:openshift-gitops:openshift-gitops-argocd-application-controller
+impersonating: system:serviceaccount:dlh-lab:argocd-deployer-dlh-lab
+```
+
 ## Tworzenie Application
 
 Application **musi** wskazywać na projekt `dlh-lab` (nie `default`):
@@ -202,9 +291,11 @@ oc annotate application gitops-demo -n dlh-lab argocd.argoproj.io/refresh=hard -
 
 Aby dodać ArgoCD do nowego namespace (np. `team-xyz`):
 
-1. Dodaj namespace do `sourceNamespaces` w ArgoCD CR
-2. Utwórz dedykowany AppProject (jak w kroku 2) z `destinations`, `sourceNamespaces` i `destinationServiceAccounts` ustawionym na nowy namespace
-3. Utwórz dedykowany ServiceAccount + Role + RoleBinding w nowym namespace (jak w kroku 3)
+1. Dodaj namespace do `sourceNamespaces` w ArgoCD CR (krok 1)
+2. Utwórz dedykowany AppProject z `destinationServiceAccounts` (krok 2)
+3. Włącz impersonację — jednorazowo, jeśli jeszcze nie włączona (krok 3)
+4. Utwórz dedykowany ServiceAccount + Role + RoleBinding (krok 4)
+5. Utwórz Role + RoleBinding na verb `impersonate` (krok 5)
 
 **Nie dodawaj** nowych namespace'ów do projektu `default`.
 **Nie używaj** `--clusterrole=edit` — zawsze twórz dedykowany SA z minimalnymi uprawnieniami.
@@ -283,7 +374,16 @@ spec:
 EOF
 ```
 
-### Krok 3 — Utwórz ServiceAccount, Role i RoleBinding
+### Krok 3 — Włącz impersonację (jednorazowo)
+
+> **Jeśli już wykonałeś ten krok** dla innego namespace — pomiń go. Ustawienie jest globalne.
+
+```bash
+oc patch argocd openshift-gitops -n openshift-gitops --type merge \
+  -p '{"spec":{"extraConfig":{"application.sync.impersonation.enabled":"true"}}}'
+```
+
+### Krok 4 — Utwórz ServiceAccount, Role i RoleBinding
 
 ```bash
 cat <<'EOF' | sed 's/<NAMESPACE>/NAZWA_NAMESPACE/g' | oc apply -f -
@@ -337,7 +437,40 @@ subjects:
 EOF
 ```
 
-### Krok 4 — Utwórz Application
+### Krok 5 — Uprawnienia do impersonacji SA
+
+```bash
+cat <<'EOF' | sed 's/<NAMESPACE>/NAZWA_NAMESPACE/g' | oc apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: allow-argocd-impersonate-deployer
+  namespace: <NAMESPACE>
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["impersonate"]
+    resourceNames: ["argocd-deployer-<NAMESPACE>"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: allow-argocd-controller-impersonate
+  namespace: <NAMESPACE>
+subjects:
+  - kind: ServiceAccount
+    name: openshift-gitops-argocd-application-controller
+    namespace: openshift-gitops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: allow-argocd-impersonate-deployer
+EOF
+```
+
+> `resourceNames` ogranicza impersonację wyłącznie do SA `argocd-deployer-<NAMESPACE>` w danym namespace.
+
+### Krok 6 — Utwórz Application
 
 Developerzy mogą teraz tworzyć Applications w swoim namespace:
 
@@ -385,7 +518,9 @@ oc get application -n <NAMESPACE>
 
 - [ ] Namespace istnieje (`oc new-project <NAMESPACE>` lub `oc create namespace <NAMESPACE>`)
 - [ ] ArgoCD CR ma namespace w `sourceNamespaces`
-- [ ] AppProject utworzony w `openshift-gitops` z ograniczeniami
+- [ ] AppProject utworzony w `openshift-gitops` z ograniczeniami i `destinationServiceAccounts`
+- [ ] Impersonacja włączona w ArgoCD CR (`extraConfig: application.sync.impersonation.enabled: "true"`) — jednorazowo
 - [ ] SA `argocd-deployer-<NAMESPACE>` utworzony w namespace
-- [ ] Role i RoleBinding utworzone w namespace
+- [ ] Role `argocd-deployer` i RoleBinding utworzone w namespace
+- [ ] Role `allow-argocd-impersonate-deployer` + RoleBinding na verb `impersonate` utworzone w namespace
 - [ ] Namespace NIE dodany do AppProject `default`

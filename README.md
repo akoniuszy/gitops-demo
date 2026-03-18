@@ -88,6 +88,15 @@ oc create namespace <NAMESPACE>
 
 ### Krok 2 — Dodaj namespace do ArgoCD CR
 
+**Pierwszy namespace** (lista `sourceNamespaces` jeszcze nie istnieje) — merge patch:
+
+```bash
+oc patch argocd openshift-gitops -n openshift-gitops --type merge \
+  -p '{"spec":{"sourceNamespaces":["<NAMESPACE>"]}}'
+```
+
+**Kolejny namespace** (lista już istnieje) — JSON Patch dopisuje do istniejącej tablicy:
+
 ```bash
 oc patch argocd openshift-gitops -n openshift-gitops --type json \
   -p '[{"op":"add","path":"/spec/sourceNamespaces/-","value":"<NAMESPACE>"}]'
